@@ -1,24 +1,55 @@
 #!/usr/bin/env python3
+import ctypes
 import logging
+import subprocess
+import sys
 import tempfile
 import os
 import time
 import hashlib
 import filecmp
 import shutil
+from functools import wraps
 
 # In order to increase performance, we do not read all content of huge files
 # To guarantee correct operation, additional verification of files with the same hash has been provided.
-PACKAGE_SIZE = 4096  # bytes
-MD5_MAX_PACKAGES = 12800  # 50 MB
+PACKAGE_SIZE = 102400  # 100 KB
+MD5_MAX_PACKAGES = 1  # 10 KB
 VERSION = '2.0'
 
 logging.basicConfig()
-logging.root.setLevel(logging.INFO)
+logging.root.setLevel(logging.DEBUG)
 logger = logging.getLogger('default')
 
 
 ############################# INTERFACE FUNCTIONS #############################
+
+def timeit(func):
+    @wraps(func)
+    def timeit_wrapper(*args, **kwargs):
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        end_time = time.perf_counter()
+        total_time = end_time - start_time
+        print(f'Function {func.__name__}{args} {kwargs} Took {total_time:.4f} seconds')
+        return result
+
+    return timeit_wrapper
+
+
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except AttributeError:
+        return os.getuid() == 0
+
+
+def rerun_with_admin_rights():
+    try:
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
+    except:
+        subprocess.call(['sudo', 'python3', *sys.argv])
+
 
 def to_readable_size(byte_size):
     unit = ["B", "KB", "MB", "GB", "TB"]
@@ -29,10 +60,10 @@ def to_readable_size(byte_size):
     return "{:.1f} ".format(byte_size) + unit[unit_idx]
 
 
-def get_functionality_option(options):
+def get_number_from_list(options):
     number = get_number_from_input()
     while number not in options:
-        print("Provided invaild option number, try again : ", end='')
+        print("Provided invalid number, try again : ", end='')
         number = get_number_from_input()
     return number
 
@@ -79,16 +110,16 @@ def get_number_from_input_not_less_than(x):
     return number
 
 
-def print_cleaner_stats(total_files, total_size, final_files, final_size):
-    if total_files == 0 or total_size == 0:
+def print_cleaner_stats(initial_count, initial_size, final_count, final_size):
+    if initial_count == 0 or initial_size == 0:
         return
-    removed_files = total_files - final_files
-    removed_size = total_size - final_size
-    reduced_files = final_files / total_files * 100
-    reduced_size = final_size / total_size * 100
+    removed_files = initial_count - final_count
+    removed_size = initial_size - final_size
+    reduced_files = final_count / initial_count * 100
+    reduced_size = final_size / initial_size * 100
     print("\t\tFiles \tSize")
-    print("Total: \t\t{} \t{}".format(total_files, to_readable_size(total_size)))
-    print("Left: \t\t{} \t{}".format(final_files, to_readable_size(final_size)))
+    print("Initial: \t{} \t{}".format(initial_count, to_readable_size(initial_size)))
+    print("Left: \t\t{} \t{}".format(final_count, to_readable_size(final_size)))
     print("Removed: \t{} \t{}".format(removed_files, to_readable_size(removed_size)))
     print("Reduced to: \t{:.1f}% \t{:.1f}%".format(reduced_files, reduced_size))
 
@@ -111,15 +142,18 @@ def print_sync_stats(
 def remove_file(path):
     try:
         os.remove(path)
-    except:
-        print("Error while deleting file ", path)
+    except Exception as e:
+        logger.info("Error while deleting file " + path)
+        logger.exception(e)
 
 
 def remove_dir(dir_path):
     try:
         shutil.rmtree(dir_path)
-    except:
-        print("Error while deleting dir ", dir_path)
+        wait_on_dir_exist(dir_path, exist=False)
+    except Exception as e:
+        logger.info("Error while removing dir " + dir_path)
+        logger.exception(e)
 
 
 def remove_empty_folders(path):
@@ -132,7 +166,7 @@ def remove_empty_folders(path):
             remove_empty_folders(fullpath)
 
     if len(os.listdir(path)) == 0:
-        os.rmdir(path)
+        remove_dir(path)
 
 
 def deep_file_copy(src, dst):
@@ -151,14 +185,14 @@ def wait_on_empty_dir(root_dir):
         time.sleep(0.05)
 
 
-def wait_on_path_exist(fileDir, exist=True):
+def wait_on_dir_exist(fileDir, exist=True):
     while os.path.isdir(fileDir) is not exist:
         time.sleep(0.05)
 
 
 def create_temp_dir(parent_dir):
     temp_dir = tempfile.mkdtemp(dir=parent_dir)
-    wait_on_path_exist(temp_dir)
+    wait_on_dir_exist(temp_dir)
     return temp_dir
 
 
@@ -199,7 +233,7 @@ def get_duplicates_from_array(file_path, path_array):
 
 def get_hash_of_file(file_path):
     with open(file_path, "rb") as f:
-        file_hash = hashlib.md5()
+        file_hash = hashlib.sha256()
         count = 0
         while (chunk := f.read(PACKAGE_SIZE)) and count < MD5_MAX_PACKAGES:
             count += 1
@@ -207,14 +241,22 @@ def get_hash_of_file(file_path):
     return str(os.stat(file_path).st_size) + file_hash.hexdigest()
 
 
-def analyze_dir(root_dir):
+def analyze_dir(root_dir, recursively=True):
     count = 0
     size = 0
-    for root, _, files in os.walk(root_dir):
-        for name in files:
-            path = os.path.join(root, name)
-            size += os.stat(path).st_size
-            count += 1
+
+    if recursively:
+        for root, _, files in os.walk(root_dir):
+            for name in files:
+                path = os.path.join(root, name)
+                size += os.stat(path).st_size
+                count += 1
+    else:
+        for filename in os.listdir(root_dir):
+            path = os.path.join(root_dir, filename)
+            if os.path.isfile(path):
+                size += os.stat(path).st_size
+                count += 1
 
     return count, size
 
@@ -229,6 +271,7 @@ def analyze_paths(paths):
 
 ############################# CODE #############################
 
+@timeit
 def extract_collection_from_dir(root_dir, initCollection={}):
     def do_nothing(*args):
         pass
@@ -241,6 +284,7 @@ def remove_duplicated_files(root_dir, initCollection={}):
         pass
 
     def remove(file_path, files_with_same_content):
+        logger.info("Removing duplicated file: " + os.path.relpath(file_path, root_dir))
         remove_file(file_path)
 
     return collect_files_with_callbacks(root_dir, remove, do_nothing, False, True, initCollection)
@@ -261,8 +305,13 @@ def find_existing_and_extra_files(base_dir, work_dir):
         else:
             work_dir_existing_in_other_path.add(file_path)
 
+    logger.info("Reading Base dir - Started")
     base_dir_collection = extract_collection_from_dir(base_dir)
+    logger.info("Reading Base dir - Finished")
+
+    logger.info("Reading Work dir - Started")
     collect_files_with_callbacks(work_dir, on_duplicate, on_new, False, False, base_dir_collection)
+    logger.info("Reading Work dir - Finished")
 
     return base_dir_collection, base_dir_existing, work_dir_extra_files, work_dir_existing_in_other_path
 
@@ -274,6 +323,7 @@ def collect_files_with_callbacks(root_dir,
                                  collectOnNew,
                                  collection={}):
     for root, _, files in os.walk(root_dir):
+        logger.debug("Processing dir: " + root)
         for file_name in files:
             file_path = os.path.join(root, file_name)
             file_hash = get_hash_of_file(file_path)
@@ -337,16 +387,19 @@ def synchronize_data(master_dir, slave_dir):
         logger.info("Removing extra file: " + os.path.relpath(path, slave_dir))
         remove_file(path)
 
-    logger.info("Removing empty directories")
+    logger.info("Removing empty directories - Started")
     remove_empty_folders(slave_dir)
+    logger.info("Removing empty directories - Finished")
 
+    logger.info("Copying files - Started")
     master_files = {path for paths in m_collection.values() for path in paths}
     to_be_copied = master_files.difference(to_be_skipped)
     for master_file in to_be_copied:
         rel_path = os.path.relpath(master_file, master_dir)
-        logger.info("Moving file: " + rel_path)
+        logger.info("Copying file: " + rel_path)
         slave_file = os.path.join(slave_dir, rel_path)
         deep_file_copy(master_file, slave_file)
+    logger.info("Copying files - Finished")
 
     count_total, size_total = analyze_dir(master_dir)
     count_skipped, size_skipped = analyze_paths(to_be_skipped)
@@ -358,6 +411,47 @@ def synchronize_data(master_dir, slave_dir):
         count_removed, size_removed,
         count_copied, size_copied
     )
+
+
+def remove_files_with_same_name(root_path, recursively=True):
+    for dir_path, _, filenames in os.walk(root_path):
+        print('Current path: ' + dir_path)
+        register = {}
+        for filename in filenames:
+            name, file_extension = os.path.splitext(filename)
+            if not name or len(name) == 0 or not file_extension or len(file_extension) == 0:
+                continue
+            if name in register:
+                register[name].append(file_extension)
+            else:
+                register[name] = [file_extension]
+
+        register = {k: tuple(sorted(v)) for k, v in register.items() if len(v) > 1}
+        extensions_tuples = {tuple(v) for v in register.values()}
+        extensions_tuples = {tuple(map(lambda s: s.upper(), v)) for v in extensions_tuples}
+
+        if len(extensions_tuples) == 0:
+            print('Nothing to do in directory.')
+        else:
+            decisions = {}
+            for case in extensions_tuples:
+                case_decisions = {}
+                print('Detected same filename with extensions: ' + ', '.join(case))
+                for ext in case:
+                    print('Remove ' + ext + ' file (y/n) ? ', end='')
+                    case_decisions[ext] = get_bool_from_input()
+                decisions[case] = case_decisions
+
+            for name, exts in register.items():
+                case_decisions = decisions[tuple(map(lambda s: s.upper(), exts))]
+                for ext in exts:
+                    if case_decisions[ext.upper()]:
+                        filename = name + ext
+                        logger.info('Removing file: ' + filename)
+                        remove_file(os.path.join(dir_path, filename))
+
+        if not recursively:
+            break
 
 
 ############################### MENU INTERFACES ###############################
@@ -433,6 +527,17 @@ def menu_sync_data():
     synchronize_data(master_dir, slave_dir)
 
 
+def menu_remove_files_with_same_name():
+    print("Provide dir: ", end='')
+    root_dir = get_dir_from_input()
+    print("Do you want to perform the action for subdirectories as well? (y/n): ", end='')
+    recursively = get_bool_from_input()
+    c1, s1 = analyze_dir(root_dir, recursively=recursively)
+    remove_files_with_same_name(root_dir, recursively)
+    c2, s2 = analyze_dir(root_dir, recursively=recursively)
+    print_cleaner_stats(c1, s1, c2, s2)
+
+
 def start_menu():
     print(
         "Duplicate Remover v" + VERSION + " - Script functionalities: \n" +
@@ -441,11 +546,12 @@ def start_menu():
         "It analyze one directory and then remove duplicated files from the other one.\n" +
         "(3) Rename all files in directory tree using last modification datetime.\n" +
         "(4) Move all files to root directory.\n" +
-        "(5) Synchronize data in directories"
+        "(5) Synchronize data in directories.\n"
+        "(6) Remove files with same name basing on extensions."
     )
 
     print("Choose Functionality: ", end='')
-    option = get_functionality_option([x for x in range(1, 6)])
+    option = get_number_from_list([x for x in range(1, 7)])
 
     if option == 1:
         menu_remove_in_dir()
@@ -457,7 +563,12 @@ def start_menu():
         menu_move_files_to_root()
     elif option == 5:
         menu_sync_data()
+    elif option == 6:
+        menu_remove_files_with_same_name()
 
 
-start_menu()
-input("Press Enter to continue...")
+if is_admin():
+    start_menu()
+    input("Press Enter to continue...")
+else:
+    rerun_with_admin_rights()
